@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Yandex Music Player</title>
+	  <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+    <div id="auth" class="hidden">
+        <button id="auth-btn">Войти с Яндекс ID</button>
+    </div>
+
+    <div id="playlist-selection" class="hidden">
+        <h3 class="app-title">Яндекс Музыка</h3>
+        <div id="playlist-buttons">
+            </div>
+    </div>
+
+    <div id="player-section" class="hidden">
+        <button id="back-btn">Назад</button>
+
+        <div id="current-track">
+            <img id="cover" src="" alt="Обложка трека">
+            <div id="track-info">
+                <span id="track-title"></span>
+                <span id="track-artist"></span>
+            </div>
+        </div>
+
+        <div id="progress-container">
+            <span id="current-time">0:00</span>
+            <input type="range" id="progress" value="0">
+            <span id="duration">0:00</span>
+        </div>
+
+        <div id="controls-container">
+            <input type="range" id="volume" value="100" min="0" max="100">
+            <div id="buttons-container">
+                <button id="prev"><img src="icons/track-prev.svg" alt="Предыдущий трек"></button>
+                <button id="play"><img id="play-icon" src="icons/play.svg" alt="Воспроизвести"></button>
+                <button id="next"><img src="icons/track-next.svg" alt="Следующий трек"></button>
+            </div>
+        </div>
+        <ul id="track-list"></ul>
+    </div>
+    <p id="error" class="hidden"></p>
+
+    <script src="popup.js"></script>
+</body>
+</html>

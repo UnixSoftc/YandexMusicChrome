@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Yandex Music",
+  "description": "Расширение для Яндекс Музыки",
+  "version": "0.2.0",
+  "permissions": [
+    "storage",
+    "tabs",
+    "activeTab",
+    "notifications",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "https://*.yandex.ru/*",
+    "https://api.music.yandex.net/*",
+    "https://storage.mds.yandex.net/*"
+  ],
+  "icons": {
+    "16": "icon.svg",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Yandex Music",
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["fonts/YSText-Regular.woff2"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
