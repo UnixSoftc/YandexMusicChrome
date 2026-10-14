@@ -1,356 +1,346 @@
-// background.js – OAuth + offscreen player
+// background.js – OAuth + управление offscreen-плеером
+//
+// ВАЖНО про MV3: service worker засыпает после ~30 с простоя и теряет всю память,
+// а offscreen-документ с аудио Chrome закрывает через ~30 с после паузы.
+// Поэтому очередь, индекс, позиция и громкость хранятся в chrome.storage.local,
+// а «правда» о том, играет ли звук, берётся у offscreen-документа (если он жив).
+
 const OAUTH_APP_ID = '23cabbbdc6cd418abb4b39c32c41195d';
 const TOKEN_KEY    = 'yandex-music-token';
+const STATE_KEY    = 'player-state';
 const OAUTH_URL    = `https://oauth.yandex.ru/authorize?response_type=token&client_id=${OAUTH_APP_ID}`;
 const TOKEN_RE     = /https:\/\/music\.yandex\.(?:ru|com|by|kz|ua)\/#access_token=([^&]*)/;
+const OFFSCREEN_URL = 'offscreen.html';
+const SIGN_SALT    = 'XGRlBW9FXlekgbPrRHuSiA';
+const MAX_FAILS    = 5;   // подряд неудачных треков, после чего останавливаемся
 
-let oauthTabId = null;
-let offscreenReady = false;
-let offscreenCreating = false;
+/* ------------------------------ состояние ------------------------------ */
+const DEFAULT_STATE = { queue: [], playlistId: null, index: 0, position: 0, volume: 1 };
+let st = { ...DEFAULT_STATE };                       // сохраняется в storage
+const rt = { isPlaying: false, loading: false, currentTime: 0, duration: 0 }; // только в памяти
+let playToken = 0;   // защита от гонок: «устаревшие» загрузки треков игнорируются
+let failCount = 0;
+let lastPosSave = 0;
 
-// Состояние воспроизведения, которое background.js будет хранить
-let currentPlaybackState = {
-  currentTrackIndex: 0,
-  isPlaying: false,
-  currentTrackListIds: [], // Только ID треков
-  currentFullTrackListInfo: [], // Полная информация о треках
-  currentPlaylistId: null,
-  currentTime: 0, // Добавлено для синхронизации прогресса
-  duration: 0     // Добавлено для синхронизации прогресса
-};
+let persistTimer = null;
+function persist() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => chrome.storage.local.set({ [STATE_KEY]: st }), 200);
+}
 
-/* OAuth flow */
-function openOauthTab(){ chrome.tabs.create({url:OAUTH_URL}, t=> oauthTabId=t.id); }
-chrome.tabs.onUpdated.addListener((id,_c,tab)=>{
-  if(id!==oauthTabId||!tab.url) return;
-  const m=tab.url.match(TOKEN_RE);
-  if(m&&m[1]){
-    chrome.storage.local.set({[TOKEN_KEY]:m[1]});
-    chrome.tabs.remove(oauthTabId); oauthTabId=null;
-    chrome.runtime.sendMessage({action:'token_updated', token:m[1]});
+const stateReady = loadState().catch(e => console.error('loadState', e));
+async function loadState() {
+  const r = await chrome.storage.local.get(STATE_KEY);
+  if (r[STATE_KEY]) st = { ...DEFAULT_STATE, ...r[STATE_KEY] };
+  // offscreen мог пережить перезапуск service worker — синхронизируемся с ним
+  const info = await getAudioInfo();
+  if (info && info.hasSrc) {
+    rt.isPlaying = !info.paused;
+    rt.currentTime = info.currentTime;
+    rt.duration = info.duration || 0;
   }
+}
+
+const run = fn => stateReady.then(fn).catch(e => console.error(e));
+const notify = msg => chrome.runtime.sendMessage(msg).catch(() => {}); // popup может быть закрыт
+
+function publicState() {
+  return {
+    playlistId: st.playlistId, index: st.index, queue: st.queue,
+    isPlaying: rt.isPlaying, loading: rt.loading,
+    currentTime: rt.currentTime, duration: rt.duration, volume: st.volume
+  };
+}
+const push = () => notify({ action: 'playback_state_updated', ...publicState() });
+const reportError = message => notify({ action: 'player_error', message });
+
+/* ------------------------------- OAuth --------------------------------- */
+// tabId хранится в storage.session: пока пользователь вводит пароль, worker успевает уснуть
+async function openOauthTab() {
+  const tab = await chrome.tabs.create({ url: OAUTH_URL });
+  await chrome.storage.session.set({ oauthTabId: tab.id });
+}
+chrome.tabs.onUpdated.addListener(async (id, _c, tab) => {
+  if (!tab.url || !tab.url.includes('#access_token=')) return;
+  const { oauthTabId } = await chrome.storage.session.get('oauthTabId');
+  if (id !== oauthTabId) return;
+  const m = tab.url.match(TOKEN_RE);
+  if (!m || !m[1]) return;
+  await chrome.storage.session.remove('oauthTabId');
+  await chrome.storage.local.set({ [TOKEN_KEY]: m[1] });
+  chrome.tabs.remove(id);
+  notify({ action: 'token_updated', token: m[1] });
 });
 
-/* one-shot offscreen factory */
-async function ensureOffscreen(){
-  if(offscreenReady || offscreenCreating) return;
-  offscreenCreating = true;
-  if(chrome.offscreen){
-    const exists = await chrome.offscreen.hasDocument?.();
-    if(!exists){
-      await chrome.offscreen.createDocument({
-        url:'offscreen.html',
-        reasons:[chrome.offscreen.Reason.AUDIO_PLAYBACK],
-        justification:'Yandex Music background playback'
-      });
+/* ------------------------------ offscreen ------------------------------ */
+async function hasOffscreen() {
+  const url = chrome.runtime.getURL(OFFSCREEN_URL);
+  if (chrome.runtime.getContexts) {
+    const ctx = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'], documentUrls: [url] });
+    return ctx.length > 0;
+  }
+  const clients = await self.clients.matchAll();
+  return clients.some(c => c.url === url);
+}
+
+let creating = null;
+async function ensureOffscreen() {
+  if (await hasOffscreen()) return;
+  if (!creating) {
+    creating = chrome.offscreen.createDocument({
+      url: OFFSCREEN_URL,
+      reasons: [chrome.offscreen.Reason.AUDIO_PLAYBACK],
+      justification: 'Yandex Music background playback'
+    }).finally(() => { creating = null; });
+  }
+  try { await creating; }
+  catch (e) { if (!/single offscreen/i.test(e.message)) throw e; }
+}
+
+async function toOffscreen(msg) {
+  try { await chrome.runtime.sendMessage({ target: 'offscreen', ...msg }); } catch { /* документа нет */ }
+}
+
+// null — если offscreen-документа нет (не создан или закрыт Chrome)
+async function getAudioInfo() {
+  if (!(await hasOffscreen())) return null;
+  try {
+    const timeout = new Promise(r => setTimeout(() => r(null), 700));
+    return (await Promise.race([chrome.runtime.sendMessage({ target: 'offscreen', action: 'get_audio_info' }), timeout])) || null;
+  } catch { return null; }
+}
+
+async function getFullState() {
+  await stateReady;
+  if (!rt.loading) {
+    const info = await getAudioInfo();
+    if (info && info.hasSrc) {
+      rt.isPlaying = !info.paused;
+      rt.currentTime = info.currentTime;
+      rt.duration = info.duration || rt.duration;
+    } else {
+      // звука нет (первый запуск / документ закрыт) — показываем сохранённую позицию
+      rt.isPlaying = false;
+      rt.currentTime = st.position;
+      rt.duration = (st.queue[st.index] && st.queue[st.index].duration) || 0;
     }
   }
-  offscreenReady = true;
-  offscreenCreating = false;
+  return publicState();
 }
 
-// Функция для обновления состояния и отправки в попап
-async function updateAndNotifyPopup(changes = {}) {
-  Object.assign(currentPlaybackState, changes);
-  chrome.storage.local.set({
-    currentIndex: currentPlaybackState.currentTrackIndex,
-    isPlaying: currentPlaybackState.isPlaying,
-    trackIds: currentPlaybackState.currentTrackListIds,
-    playlistId: currentPlaybackState.currentPlaylistId
-    // currentTime и duration не сохраняются постоянно, а запрашиваются при необходимости
-  });
-
-  // Отправляем полное состояние в popup
-  chrome.runtime.sendMessage({
-    action: 'playback_state_updated',
-    currentIndex: currentPlaybackState.currentTrackIndex,
-    isPlaying: currentPlaybackState.isPlaying,
-    trackList: currentPlaybackState.currentTrackListIds,
-    fullTrackInfo: currentPlaybackState.currentFullTrackListInfo, // Отправляем полную инфу
-    playlistId: currentPlaybackState.currentPlaylistId,
-    currentTime: currentPlaybackState.currentTime, // Передаем текущее время
-    duration: currentPlaybackState.duration       // Передаем длительность
-  });
+/* ------------------------------ воспроизведение ------------------------ */
+async function playQueue({ playlistId, tracks, index }) {
+  if (!Array.isArray(tracks) || !tracks.length) return;
+  st.queue = tracks.map(({ id, title, artists, cover, duration }) => ({ id, title, artists, cover, duration }));
+  st.playlistId = playlistId || null;
+  await playTrack(index || 0);
 }
 
-async function playTrack(index, playlistId) {
-    if (!currentPlaybackState.currentTrackListIds.length || !currentPlaybackState.currentFullTrackListInfo.length || !playlistId || !currentPlaybackState.currentPlaylistId) {
-        console.warn("Нет активного плейлиста или треков для воспроизведения. Попытка загрузить из хранилища...");
-        const stored = await chrome.storage.local.get(['trackIds', TOKEN_KEY, 'playlistId']);
-        if (stored.trackIds && stored.trackIds.length && stored.playlistId) {
-            currentPlaybackState.currentTrackListIds = stored.trackIds;
-            currentPlaybackState.currentPlaylistId = stored.playlistId;
-            // Здесь нужен способ восстановить fullTrackInfo, если popup закрыт
-            // Возможно, fetchPlaylist снова, или сохранять fullTrackInfo в storage
-            // Для простоты пока используем то, что есть, а полный список получит popup при открытии
-            console.warn("Восстановлен плейлист из хранилища, но полная информация о треках может отсутствовать до открытия попапа.");
-        } else {
-            console.error("Невозможно воспроизвести трек: нет плейлиста в текущем состоянии или хранилище.");
-            return;
-        }
-    }
+async function playTrack(index, { startAt = 0, dir = 1, auto = false } = {}) {
+  const n = st.queue.length;
+  if (!n) return;
+  if (!auto) failCount = 0;
+  index = ((index % n) + n) % n;
+  const my = ++playToken;
+  const track = st.queue[index];
 
+  st.index = index; st.position = startAt;
+  rt.isPlaying = true; rt.loading = true; rt.currentTime = startAt; rt.duration = track.duration || 0;
+  persist(); push();
+
+  try {
     const token = (await chrome.storage.local.get(TOKEN_KEY))[TOKEN_KEY];
-    if (!token) {
-        console.error("Токен Яндекс Музыки не найден. Невозможно воспроизвести трек.");
-        return;
-    }
-
-    const trackIdToPlay = currentPlaybackState.currentTrackListIds[index];
-    if (!trackIdToPlay) {
-        console.error("Не удалось найти трек по индексу", index);
-        return;
-    }
-
-    try {
-        const url = await fetchTrackUrl(token, trackIdToPlay);
-        await ensureOffscreen();
-        chrome.runtime.sendMessage({ action: 'play', url, target: 'offscreen' });
-        updateAndNotifyPopup({
-            currentTrackIndex: index,
-            isPlaying: true,
-            playlistId: playlistId || currentPlaybackState.currentPlaylistId // Убедимся, что ID плейлиста установлен
-        });
-        console.log(`Playing track index: ${index}, ID: ${trackIdToPlay}`);
-    } catch (e) {
-        console.error("Error playing track:", e);
-        updateAndNotifyPopup({ isPlaying: false }); // Останавливаем воспроизведение в UI
-    }
-}
-
-async function nextTrack() {
-    if (!currentPlaybackState.currentTrackListIds.length) return;
-    const newIndex = (currentPlaybackState.currentTrackIndex + 1) % currentPlaybackState.currentTrackListIds.length;
-    await playTrack(newIndex, currentPlaybackState.currentPlaylistId);
-}
-
-async function prevTrack() {
-    if (!currentPlaybackState.currentTrackListIds.length) return;
-    const newIndex = (currentPlaybackState.currentTrackIndex - 1 + currentPlaybackState.currentTrackListIds.length) % currentPlaybackState.currentTrackListIds.length;
-    await playTrack(newIndex, currentPlaybackState.currentPlaylistId);
-}
-
-
-// router
-chrome.runtime.onMessage.addListener(async (msg) => {
-    if (msg.action === 'open_oauth') {
-        openOauthTab();
-        return;
-    }
-    
-    // Получение информации о плейлисте и треках от popup.js
-    if (msg.action === 'set_playlist_info') {
-        currentPlaybackState.currentTrackListIds = msg.trackIds;
-        currentPlaybackState.currentFullTrackListInfo = msg.fullTrackInfo; // Сохраняем полную инфу
-        currentPlaybackState.currentPlaylistId = msg.playlistId;
-        console.log('Playlist info set in background:', currentPlaybackState.currentPlaylistId, currentPlaybackState.currentTrackListIds.length);
-        return;
-    }
-
-    // Воспроизведение трека по индексу из popup.js
-    if (msg.action === 'play_track_by_index') {
-        await playTrack(msg.index, msg.playlistId);
-        return;
-    }
-
-    if (msg.action === 'track_ended') {
-        await nextTrack(); // Переходим к следующему треку при окончании текущего
-        return;
-    }
-
-    if (msg.action === 'prev_track') {
-        await prevTrack();
-        return;
-    }
-
-    if (msg.action === 'next_track') {
-        await nextTrack();
-        return;
-    }
-
-    if (msg.action === 'pause') {
-        await ensureOffscreen();
-        chrome.runtime.sendMessage({ target: 'offscreen', action: 'pause' });
-        updateAndNotifyPopup({ isPlaying: false });
-        return;
-    }
-
-    if (msg.action === 'resume_or_play_current') {
-        if (currentPlaybackState.isPlaying) { // Уже играет, ничего не делаем
-            return;
-        }
-        if (currentPlaybackState.currentTrackListIds.length > 0) {
-            // Если есть трек и он не играет, возобновляем или начинаем с текущего
-            // Проверяем, играет ли offscreen что-то, прежде чем отправлять resume
-            await ensureOffscreen();
-            chrome.runtime.sendMessage({ target: 'offscreen', action: 'resume' });
-            updateAndNotifyPopup({ isPlaying: true });
-        } else {
-             // Если нет треков, возможно, нужно загрузить последний плейлист
-             // (Этот сценарий уже должен быть обработан при инициализации попапа,
-             // когда он запрашивает get_current_playback_state)
-            console.warn("Попытка воспроизвести без загруженного плейлиста.");
-        }
-        return;
-    }
-
-    if (msg.action === 'set_volume') {
-        await ensureOffscreen();
-        chrome.runtime.sendMessage({ target: 'offscreen', action: 'set_volume', value: msg.value });
-        return;
-    }
-
-    if (msg.action === 'seek') {
-        await ensureOffscreen();
-        chrome.runtime.sendMessage({ target: 'offscreen', action: 'seek', value: msg.value });
-        return;
-    }
-
-    // Получение информации о прогрессе от offscreen.js и пересылка в popup.js
-    if (msg.action === 'update_progress') {
-        currentPlaybackState.currentTime = msg.currentTime;
-        currentPlaybackState.duration = msg.duration;
-        chrome.runtime.sendMessage(msg); // Пересылаем в popup
-        return;
-    }
-
-    // Обработчик для запроса текущего состояния воспроизведения от popup.js
-    if (msg.action === 'get_current_playback_state') {
-        console.log("Popup requested current playback state.");
-        // Сначала пытаемся получить текущее время и длительность из offscreen.js
-        if (offscreenReady) {
-            chrome.runtime.sendMessage({ action: 'get_audio_info', target: 'offscreen' });
-        }
-        // Затем отправляем текущее состояние (которое уже должно быть обновлено)
-        // ВАЖНО: `playback_state_updated` должен быть отправлен после того, как `update_progress`
-        // принесет последние данные о времени/длительности, если это возможно.
-        // Для простоты, пока отправляем то, что есть сразу.
-        // Более сложное решение - промис, который ждет ответа от offscreen.js
-        // Но `update_progress` обрабатывается асинхронно, так что popup получит его позже.
-        updateAndNotifyPopup(); // Отправляем текущее состояние
-        return;
-    }
-});
-
-// Инициализация состояния из хранилища при запуске service worker
-chrome.runtime.onInstalled.addListener(() => {
-    chrome.storage.local.get(['currentIndex', 'isPlaying', 'trackIds', 'playlistId'], (r) => {
-        currentPlaybackState.currentTrackIndex = r.currentIndex || 0;
-        currentPlaybackState.isPlaying = r.isPlaying || false;
-        currentPlaybackState.currentTrackListIds = r.trackIds || [];
-        currentPlaybackState.currentPlaylistId = r.playlistId || null;
-        console.log("Background state initialized from storage:", currentPlaybackState);
-        // Если музыка играла до закрытия расширения/браузера, возобновляем воспроизведение
-        if (currentPlaybackState.isPlaying && currentPlaybackState.currentTrackListIds.length > 0 && currentPlaybackState.currentPlaylistId) {
-            playTrack(currentPlaybackState.currentTrackIndex, currentPlaybackState.currentPlaylistId);
-        }
+    if (!token) throw new ApiError(401, 'Нет токена');
+    const url = await fetchTrackUrl(token, track.id);
+    if (my !== playToken) return;
+    await ensureOffscreen();
+    if (my !== playToken) return;
+    await toOffscreen({
+      action: 'play', url, startAt, volume: st.volume,
+      meta: { title: track.title, artist: track.artists, cover: track.cover }
     });
-});
-
-// Функции для работы с API (без изменений)
-function json(url, token, opts) {
-  opts = opts || {};
-  var headers = opts.headers || {};
-  headers.Authorization = 'OAuth ' + token;
-  opts.headers = headers;
-  return fetch(url, opts).then(function (res) {
-    if (!res.ok) {
-      throw new Error(res.status + ' – ' + res.statusText + ' @ ' + url);
+    // rt.loading сбросится, когда offscreen пришлёт audio_state(playing)
+  } catch (e) {
+    if (my !== playToken) return;
+    console.error('playTrack:', e);
+    rt.loading = false;
+    if (e.status === 401) {
+      rt.isPlaying = false; push();
+      await chrome.storage.local.remove(TOKEN_KEY);
+      notify({ action: 'auth_required' });
+      return;
     }
-    return res.json();
-  });
-}
-function fetchPlaylistOfTheDay(token) {
-  return json('https://api.music.yandex.net/landing-blocks/personal-playlists', token)
-    .then(function (lb) {
-      if (lb && lb.name === 'Unavailable For Legal Reasons') {
-        throw new Error('Yandex API вернул "Unavailable For Legal Reasons"');
-      }
-      function isPlaylistOfDay(obj) {
-        return obj && obj.type === 'personal_playlist_item' && obj.data && obj.data.playlist &&
-          (obj.data.playlist.idForFrom === 'playlist_of_the_day' || obj.data.playlist.title === 'Плейлист дня' || obj.data.playlistType === 'playlistOfTheDay');
-      }
-      function extractId(pl) { return { playlistId: pl.uid + ':' + pl.kind }; }
-      var blocks = [];
-      if (Array.isArray(lb.items)) {
-        blocks = lb.items;
-      } else {
-        blocks = (lb.result && lb.result.blocks) || lb.blocks || [];
-      }
-      for (var i = 0; i < blocks.length; i++) {
-        var e = blocks[i];
-        if (e.type !== 'personal_playlist_item' && e.entities) {
-          for (var j = 0; j < e.entities.length; j++) {
-            var ent = e.entities[j];
-            if (isPlaylistOfDay(ent)) {
-              return extractId(ent.data.playlist);
-            }
-          }
-        } else if (isPlaylistOfDay(e)) {
-          return extractId(e.data.playlist);
-        }
-      }
-      throw new Error('Не найден «Плейлист дня» в landing blocks');
-    });
-}
-function fetchPlaylist(token, playlistId) {
-  var parts = playlistId.split(':');
-  if (parts.length !== 2) {
-    return Promise.reject(new Error('Некорректный playlistId'));
+    failCount++;
+    if (n > 1 && failCount < MAX_FAILS) {      // трек недоступен — пробуем следующий
+      return playTrack(index + dir, { dir, auto: true });
+    }
+    rt.isPlaying = false; push();
+    reportError('Не удалось воспроизвести трек: ' + e.message);
   }
-  var uid = parts[0];
-  var kind = parts[1];
-  var url = 'https://api.music.yandex.net/users/' + uid + '/playlists/' + kind + '?rich-tracks=true';
-  return fetch(url, { headers: { Authorization: 'OAuth ' + token } }).then(function (res) {
-    if (res.ok) {
-      return res.json().then(function (d) { return d.result; });
-    }
-    var body = new URLSearchParams({ playlistIds: playlistId });
-    return fetch('https://api.music.yandex.net/playlists/list', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        Authorization: 'OAuth ' + token
-      },
-      body: body
-    }).then(function (res2) {
-      if (!res2.ok) {
-        throw new Error(res2.status + ' – ' + res2.statusText);
-      }
-      return res2.json().then(function (d2) { return d2.result[0]; });
-    });
-  });
 }
-function fetchTrackUrl(token, trackId) {
-  return json('https://api.music.yandex.net/tracks/' + trackId + '/download-info', token)
-    .then(function (info) {
-      if (!(info.result && info.result.length)) {
-        throw new Error('download-info пуст');
-      }
-      var best = info.result.find(function (i) { return i.codec === 'mp3' && i.bitrateInKbps === 192; }) || info.result[0];
-      if (best.directUrl) {
-        return best.directUrl;
-      }
-      if (best.downloadInfoUrl) {
-        return resolveDownloadInfo(best.downloadInfoUrl);
-      }
-      throw new Error('Не удалось извлечь ссылку трека');
-    });
+
+const nextTrack = () => playTrack(st.index + 1, { dir: 1 });
+async function prevTrack() {
+  if (!st.queue.length) return;
+  const info = await getAudioInfo();
+  const t = info && info.hasSrc ? info.currentTime : rt.currentTime;
+  if (t > 3) return seekTo(0);                  // как в обычных плеерах: сначала в начало трека
+  return playTrack(st.index - 1, { dir: -1 });
 }
-function resolveDownloadInfo(infoUrl) {
-  return fetch(infoUrl).then(function (res) {
-    if (!res.ok) {
-      throw new Error('downloadInfoUrl ' + res.status);
+
+async function togglePlay() {
+  if (!st.queue.length) return;
+  if (rt.loading) {                              // пауза во время загрузки = отмена
+    playToken++; rt.loading = false; rt.isPlaying = false; push();
+    return;
+  }
+  const info = await getAudioInfo();
+  if (info && info.hasSrc && !info.ended) {
+    if (info.paused) {
+      await toOffscreen({ action: 'resume' });
+      rt.isPlaying = true;
+    } else {
+      st.position = info.currentTime; persist();
+      await toOffscreen({ action: 'pause' });
+      rt.isPlaying = false;
     }
-    return res.text();
-  }).then(function (xml) {
-    var host = (xml.match(/<host>([^<]+)<\/host>/) || [])[1];
-    var path = (xml.match(/<path>([^<]+)<\/path>/) || [])[1];
-    var ts   = (xml.match(/<ts>([^<]+)<\/ts>/) || [])[1];
-    var s    = (xml.match(/<s>([^<]+)<\/s>/) || [])[1];
-    if (!host || !path || !ts || !s) {
-      throw new Error('XML download info неполный');
+    push();
+  } else {
+    // Аудио нет: первый запуск либо Chrome закрыл offscreen после долгой паузы.
+    // Заново берём ссылку и продолжаем с сохранённой позиции.
+    await playTrack(st.index, { startAt: st.position });
+  }
+}
+
+async function seekTo(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return;
+  const info = await getAudioInfo();
+  rt.currentTime = sec;
+  if (info && info.hasSrc) {
+    await toOffscreen({ action: 'seek', value: sec });
+  } else {
+    st.position = sec; persist(); push();        // продолжим с этого места по Play
+  }
+}
+
+async function setVolume(v) {
+  v = Number(v);
+  if (!Number.isFinite(v)) return;
+  st.volume = Math.min(1, Math.max(0, v)); persist();
+  await toOffscreen({ action: 'set_volume', value: st.volume });
+}
+
+/* ------------------------------- router -------------------------------- */
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (!msg || msg.target) return;               // адресовано offscreen
+  switch (msg.action) {
+    case 'open_oauth':  openOauthTab(); break;
+    case 'get_current_playback_state':
+      getFullState().then(sendResponse);
+      return true;
+    case 'play_queue':  run(() => playQueue(msg)); break;
+    case 'toggle_play': run(togglePlay); break;
+    case 'next_track':  run(nextTrack); break;
+    case 'prev_track':  run(prevTrack); break;
+    case 'seek':        run(() => seekTo(msg.value)); break;
+    case 'set_volume':  run(() => setVolume(msg.value)); break;
+
+    // ---- события от offscreen ----
+    case 'update_progress':
+      run(() => {
+        if (rt.loading) return;
+        rt.currentTime = msg.currentTime;
+        if (msg.duration) rt.duration = msg.duration;
+        if (Date.now() - lastPosSave > 5000) { lastPosSave = Date.now(); st.position = msg.currentTime; persist(); }
+      });
+      break;
+    case 'audio_state':
+      run(() => {
+        const changed = rt.isPlaying !== msg.playing || rt.loading;
+        rt.isPlaying = msg.playing;
+        if (msg.playing) { rt.loading = false; failCount = 0; }
+        else { st.position = msg.currentTime || 0; persist(); }
+        if (changed) push();
+      });
+      break;
+    case 'track_ended': run(nextTrack); break;
+    case 'audio_error':
+      run(async () => {
+        if (msg.code === 1) return;             // MEDIA_ERR_ABORTED — это не ошибка
+        failCount++;
+        // первая ошибка — вероятно протухла ссылка: берём новую и продолжаем с того же места
+        if (failCount <= 1) return playTrack(st.index, { startAt: msg.currentTime || 0, auto: true });
+        if (failCount < MAX_FAILS && st.queue.length > 1) return playTrack(st.index + 1, { auto: true });
+        rt.isPlaying = false; rt.loading = false; push();
+        reportError('Ошибка воспроизведения');
+      });
+      break;
+  }
+});
+
+/* ---------------------------- Yandex Music API -------------------------- */
+class ApiError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+async function api(url, token) {
+  const res = await fetch(url, { headers: { Authorization: 'OAuth ' + token } });
+  if (!res.ok) throw new ApiError(res.status, `${res.status} – ${res.statusText}`);
+  return res.json();
+}
+
+async function fetchTrackUrl(token, trackId) {
+  const info = await api(`https://api.music.yandex.net/tracks/${trackId}/download-info`, token);
+  const list = info && info.result;
+  if (!(list && list.length)) throw new Error('download-info пуст');
+  const best = list.find(i => i.codec === 'mp3' && i.bitrateInKbps === 192) || list[0];
+  if (best.directUrl) return best.directUrl;
+  if (best.downloadInfoUrl) return resolveDownloadInfo(best.downloadInfoUrl, best.codec || 'mp3');
+  throw new Error('Не удалось извлечь ссылку трека');
+}
+
+async function resolveDownloadInfo(infoUrl, codec) {
+  const res = await fetch(infoUrl);
+  if (!res.ok) throw new Error('downloadInfoUrl ' + res.status);
+  const xml = await res.text();
+  const g = t => (xml.match(new RegExp(`<${t}>([^<]+)</${t}>`)) || [])[1];
+  const host = g('host'), path = g('path'), ts = g('ts'), s = g('s');
+  if (!host || !path || !ts || !s) throw new Error('XML download info неполный');
+  // Ссылка подписывается: md5(соль + путь без первого «/» + s)
+  const sign = md5(SIGN_SALT + path.slice(1) + s);
+  return `https://${host}/get-${codec}/${sign}/${ts}${path}`;
+}
+
+/* ------------------------------- MD5 ----------------------------------- */
+// В SubtleCrypto MD5 нет, а подпись ссылки без него не посчитать.
+function md5(str) {
+  const bytes = new TextEncoder().encode(str);
+  const len = bytes.length;
+  const padded = new Uint8Array(((len + 8) >> 6 << 6) + 64);
+  padded.set(bytes); padded[len] = 0x80;
+  const dv = new DataView(padded.buffer);
+  dv.setUint32(padded.length - 8, (len * 8) >>> 0, true);
+  dv.setUint32(padded.length - 4, Math.floor(len / 0x20000000), true);
+  const K = Array.from({ length: 64 }, (_, i) => Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) >>> 0);
+  const S = [7,12,17,22,5,9,14,20,4,11,16,23,6,10,15,21];
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  for (let off = 0; off < padded.length; off += 64) {
+    const M = Array.from({ length: 16 }, (_, i) => dv.getUint32(off + i * 4, true));
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16)      { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D;          g = (3 * i + 5) % 16; }
+      else             { F = C ^ (B | ~D);       g = (7 * i) % 16; }
+      F = (F + A + K[i] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      const sh = S[(i >> 4) * 4 + (i % 4)];
+      B = (B + ((F << sh) | (F >>> (32 - sh)))) >>> 0;
     }
-    return 'https://' + host + '/get-mp3/' + s + '/' + ts + path;
-  });
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  const out = new DataView(new ArrayBuffer(16));
+  [a0, b0, c0, d0].forEach((v, i) => out.setUint32(i * 4, v, true));
+  return [...new Uint8Array(out.buffer)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
